@@ -15,14 +15,29 @@ use {
   },
   bitcoincore_rpc::bitcoincore_rpc_json::{ImportDescriptors, Timestamp},
   bitcoincore_rpc::Client,
+  bitcoincore_rpc::RawTx,
   std::collections::BTreeSet,
 };
 
+#[derive(Deserialize)]
+pub struct DecodeRawTransactionOutput {
+  pub weight: u64,
+}
+
+#[derive(Serialize)]
+struct OutputDump {
+  inscriptions: Vec<InscriptionId>,
+  commit: String,
+  reveals: Vec<String>,
+  recovery_descriptors: Vec<String>,
+  fees: u64,
+}
+
 #[derive(Serialize)]
 struct Output {
+  inscriptions: Vec<InscriptionId>,
   commit: Txid,
-  inscription: InscriptionId,
-  reveal: Txid,
+  reveals: Vec<Txid>,
   fees: u64,
 }
 
@@ -38,9 +53,11 @@ pub(crate) struct Inscribe {
   )]
   pub(crate) commit_fee_rate: Option<FeeRate>,
   #[clap(help = "Inscribe sat with contents of <FILE>")]
-  pub(crate) file: PathBuf,
+  pub(crate) files: Vec<PathBuf>,
   #[clap(long, help = "Do not back up recovery key.")]
   pub(crate) no_backup: bool,
+  #[clap(long, help = "Do not broadcast any transactions.")]
+  pub(crate) no_broadcast: bool,
   #[clap(
     long,
     help = "Do not check that transactions are equal to or below the MAX_STANDARD_TX_WEIGHT of 400,000 weight units. Transactions over this limit are currently nonstandard and will not be relayed by bitcoind in its default configuration. Do not use this flag unless you understand the implications."
@@ -48,13 +65,18 @@ pub(crate) struct Inscribe {
   pub(crate) no_limit: bool,
   #[clap(long, help = "Don't sign or broadcast transactions.")]
   pub(crate) dry_run: bool,
+  #[clap(long, help = "Dump raw hex transactions and recovery keys to standard output.")]
+  pub(crate) dump: bool,
   #[clap(long, help = "Send inscription to <DESTINATION>.")]
   pub(crate) destination: Option<Address>,
 }
 
 impl Inscribe {
   pub(crate) fn run(self, options: Options) -> Result {
-    let inscription = Inscription::from_file(options.chain(), &self.file)?;
+    let mut inscription = Vec::new();
+    for file in self.files {
+      inscription.push(Inscription::from_file(options.chain(), file)?);
+    }
 
     let index = Index::open(&options)?;
     index.update()?;
@@ -72,7 +94,8 @@ impl Inscribe {
       .map(Ok)
       .unwrap_or_else(|| get_change_address(&client))?;
 
-    let (unsigned_commit_tx, reveal_tx, _recovery_key_pair) =
+    tprintln!("[create_inscription_transactions]");
+    let (unsigned_commit_tx, reveal_txs, recovery_key_pairs) =
       Inscribe::create_inscription_transactions(
         self.satpoint,
         inscription,
@@ -86,48 +109,102 @@ impl Inscribe {
         self.no_limit,
       )?;
 
-    utxos.insert(
-      reveal_tx.input[0].previous_output,
-      Amount::from_sat(
-        unsigned_commit_tx.output[reveal_tx.input[0].previous_output.vout as usize].value,
-      ),
-    );
+    tprintln!("[sign commit]");
+    let signed_raw_commit_tx = client
+      .sign_raw_transaction_with_wallet(&unsigned_commit_tx, None, None)?
+      .hex;
 
-    let fees =
-      Self::calculate_fee(&unsigned_commit_tx, &utxos) + Self::calculate_fee(&reveal_tx, &utxos);
+    if !self.no_limit {
+      let commit_weight = client.call::<DecodeRawTransactionOutput>("decoderawtransaction", &[signed_raw_commit_tx.raw_hex().into()],)?.weight;
+      if commit_weight > MAX_STANDARD_TX_WEIGHT.into() {
+        bail!(
+          "commit transaction weight greater than {MAX_STANDARD_TX_WEIGHT} (MAX_STANDARD_TX_WEIGHT): {commit_weight}"
+        );
+      }
+    }
+
+    tprintln!("[insert values]");
+    for reveal_tx in reveal_txs.clone() {
+      utxos.insert(
+        reveal_tx.input[0].previous_output,
+        Amount::from_sat(
+          unsigned_commit_tx.output[reveal_tx.input[0].previous_output.vout as usize].value,
+        ),
+      );
+    }
+
+    let fees = Self::calculate_fee(&unsigned_commit_tx, &utxos)
+      + reveal_txs
+        .iter()
+        .map(|reveal_tx| Self::calculate_fee(&reveal_tx, &utxos))
+        .sum::<u64>();
 
     if self.dry_run {
       print_json(Output {
         commit: unsigned_commit_tx.txid(),
-        reveal: reveal_tx.txid(),
-        inscription: reveal_tx.txid().into(),
+        reveals: reveal_txs
+          .iter()
+          .map(|reveal_tx| reveal_tx.txid())
+          .collect(),
+        inscriptions: reveal_txs
+          .iter()
+          .map(|reveal_tx| reveal_tx.txid().into())
+          .collect(),
         fees,
       })?;
     } else {
+      if self.dump {
+        let commit = signed_raw_commit_tx.raw_hex();
+
+        let mut reveals = Vec::new();
+        let mut inscriptions = Vec::new();
+        for reveal_tx in reveal_txs.iter() {
+          reveals.push(reveal_tx.raw_hex());
+          inscriptions.push(reveal_tx.txid().into());
+        }
+
+        tprintln!("[recovery pairs]");
+        let recovery_descriptors = recovery_key_pairs.iter().map(|recovery_key_pair| Inscribe::get_recovery_key(&client, *recovery_key_pair, options.chain().network()).unwrap()).collect();
+
+        print_json(OutputDump {
+          inscriptions,
+          commit,
+          reveals,
+          recovery_descriptors,
+          fees,
+        })?;
+      }
+
       // Litecoin does not support this functionality
       // if !self.no_backup {
-      //   Inscribe::backup_recovery_key(&client, recovery_key_pair, options.chain().network())?;
+      //   for recovery_key_pair in recovery_key_pairs {
+      //     Inscribe::backup_recovery_key(&client, recovery_key_pair, options.chain().network())?;
+      //   }
       // }
 
-      let signed_raw_commit_tx = client
-        .sign_raw_transaction_with_wallet(&unsigned_commit_tx, None, None)?
-        .hex;
 
-      let commit = client
-        .send_raw_transaction(&signed_raw_commit_tx)
-        .context("Failed to send commit transaction")?;
+      if !self.no_broadcast {
+        let commit = client
+          .send_raw_transaction(&signed_raw_commit_tx)
+          .context("Failed to send commit transaction")?;
 
-      let reveal = client
-        .send_raw_transaction(&reveal_tx)
-        .context("Failed to send reveal transaction")?;
+        let mut reveals = Vec::new();
+        for reveal_tx in reveal_txs {
+          reveals.push(
+            client
+              .send_raw_transaction(&reveal_tx)
+              .context("Failed to send reveal transaction")?,
+          );
+        }
 
-      print_json(Output {
-        commit,
-        reveal,
-        inscription: reveal.into(),
-        fees,
-      })?;
-    };
+        print_json(Output {
+          inscriptions: reveals.iter().map(|reveal| (*reveal).into()).collect(),
+          commit,
+          reveals: reveals.iter().map(|reveal| *reveal).collect(),
+          fees,
+        })?;
+      }
+    }
 
     Ok(())
   }
@@ -143,7 +220,7 @@ impl Inscribe {
 
   fn create_inscription_transactions(
     satpoint: Option<SatPoint>,
-    inscription: Inscription,
+    inscription: Vec<Inscription>,
     inscriptions: BTreeMap<SatPoint, InscriptionId>,
     network: Network,
     utxos: BTreeMap<OutPoint, Amount>,
@@ -152,7 +229,7 @@ impl Inscribe {
     commit_fee_rate: FeeRate,
     reveal_fee_rate: FeeRate,
     no_limit: bool,
-  ) -> Result<(Transaction, Transaction, TweakedKeyPair)> {
+  ) -> Result<(Transaction, Vec<Transaction>, Vec<TweakedKeyPair>)> {
     let satpoint = if let Some(satpoint) = satpoint {
       satpoint
     } else {
@@ -184,123 +261,172 @@ impl Inscribe {
       }
     }
 
-    let secp256k1 = Secp256k1::new();
-    let key_pair = UntweakedKeyPair::new(&secp256k1, &mut rand::thread_rng());
-    let (public_key, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
+    let mut commit_tx_addresses = Vec::new();
+    let mut reveal_fees = Vec::new();
+    let mut control_blocks = Vec::new();
+    let mut reveal_scripts = Vec::new();
+    let mut key_pairs = Vec::new();
+    let mut taproot_spend_infos = Vec::new();
 
-    let reveal_script = inscription.append_reveal_script(
-      script::Builder::new()
-        .push_slice(&public_key.serialize())
-        .push_opcode(opcodes::all::OP_CHECKSIG),
-    );
+    tprintln!("[make reveals]");
+    for inscription in inscription {
+      let secp256k1 = Secp256k1::new();
+      let key_pair = UntweakedKeyPair::new(&secp256k1, &mut rand::thread_rng());
+      let (public_key, _parity) = XOnlyPublicKey::from_keypair(&key_pair);
+      key_pairs.push(key_pair);
 
-    let taproot_spend_info = TaprootBuilder::new()
-      .add_leaf(0, reveal_script.clone())
-      .expect("adding leaf should work")
-      .finalize(&secp256k1, public_key)
-      .expect("finalizing taproot builder should work");
+      let reveal_script = inscription.append_reveal_script(
+        script::Builder::new()
+          .push_slice(&public_key.serialize())
+          .push_opcode(opcodes::all::OP_CHECKSIG),
+      );
 
-    let control_block = taproot_spend_info
-      .control_block(&(reveal_script.clone(), LeafVersion::TapScript))
-      .expect("should compute control block");
+      let taproot_spend_info = TaprootBuilder::new()
+        .add_leaf(0, reveal_script.clone())
+        .expect("adding leaf should work")
+        .finalize(&secp256k1, public_key)
+        .expect("finalizing taproot builder should work");
 
-    let commit_tx_address = Address::p2tr_tweaked(taproot_spend_info.output_key(), network);
+      let control_block = taproot_spend_info
+        .control_block(&(reveal_script.clone(), LeafVersion::TapScript))
+        .expect("should compute control block");
 
-    let (_, reveal_fee) = Self::build_reveal_transaction(
-      &control_block,
-      reveal_fee_rate,
-      OutPoint::null(),
-      TxOut {
-        script_pubkey: destination.script_pubkey(),
-        value: 0,
-      },
-      &reveal_script,
-    );
+      commit_tx_addresses.push(Address::p2tr_tweaked(
+        taproot_spend_info.output_key(),
+        network,
+      ));
+      taproot_spend_infos.push(taproot_spend_info);
 
-    let unsigned_commit_tx = TransactionBuilder::build_transaction_with_value(
+      let (_, reveal_fee) = Self::build_reveal_transaction(
+        &control_block,
+        reveal_fee_rate,
+        OutPoint::null(),
+        TxOut {
+          script_pubkey: destination.script_pubkey(),
+          value: 0,
+        },
+        &reveal_script,
+      );
+      reveal_scripts.push(reveal_script);
+      control_blocks.push(control_block);
+      reveal_fees.push(reveal_fee + TransactionBuilder::TARGET_POSTAGE);
+    }
+
+    tprintln!("[make commit]");
+    let unsigned_commit_tx = TransactionBuilder::build_transaction_with_values(
       satpoint,
       inscriptions,
       utxos,
-      commit_tx_address.clone(),
+      commit_tx_addresses.clone(),
       change,
       commit_fee_rate,
-      reveal_fee + TransactionBuilder::TARGET_POSTAGE,
+      reveal_fees,
     )?;
 
-    let (vout, output) = unsigned_commit_tx
-      .output
-      .iter()
-      .enumerate()
-      .find(|(_vout, output)| output.script_pubkey == commit_tx_address.script_pubkey())
-      .expect("should find sat commit/inscription output");
+    let mut reveal_txs = Vec::new();
+    let mut recovery_key_pairs = Vec::new();
 
-    let (mut reveal_tx, fee) = Self::build_reveal_transaction(
-      &control_block,
-      reveal_fee_rate,
-      OutPoint {
-        txid: unsigned_commit_tx.txid(),
-        vout: vout.try_into().unwrap(),
-      },
-      TxOut {
-        script_pubkey: destination.script_pubkey(),
-        value: output.value,
-      },
-      &reveal_script,
-    );
+    tprintln!("[remake reveals]");
+    let mut n = 0;
+    for ((((control_block, reveal_script), key_pair), taproot_spend_info), commit_tx_address) in
+      control_blocks
+        .iter()
+        .zip(reveal_scripts)
+        .zip(key_pairs)
+        .zip(taproot_spend_infos)
+        .zip(commit_tx_addresses)
+    {
+      let (vout, output) = unsigned_commit_tx
+        .output
+        .iter()
+        .enumerate()
+        .find(|(_vout, output)| output.script_pubkey == commit_tx_address.script_pubkey())
+        .expect("should find sat commit/inscription output");
 
-    reveal_tx.output[0].value = reveal_tx.output[0]
-      .value
-      .checked_sub(fee.to_sat())
-      .context("commit transaction output value insufficient to pay transaction fee")?;
-
-    if reveal_tx.output[0].value < reveal_tx.output[0].script_pubkey.dust_value().to_sat() {
-      bail!("commit transaction output would be dust");
-    }
-
-    let mut sighash_cache = SighashCache::new(&mut reveal_tx);
-
-    let signature_hash = sighash_cache
-      .taproot_script_spend_signature_hash(
-        0,
-        &Prevouts::All(&[output]),
-        TapLeafHash::from_script(&reveal_script, LeafVersion::TapScript),
-        SchnorrSighashType::Default,
-      )
-      .expect("signature hash should compute");
-
-    let signature = secp256k1.sign_schnorr(
-      &secp256k1::Message::from_slice(signature_hash.as_inner())
-        .expect("should be cryptographically secure hash"),
-      &key_pair,
-    );
-
-    let witness = sighash_cache
-      .witness_mut(0)
-      .expect("getting mutable witness reference should work");
-    witness.push(signature.as_ref());
-    witness.push(reveal_script);
-    witness.push(&control_block.serialize());
-
-    let recovery_key_pair = key_pair.tap_tweak(&secp256k1, taproot_spend_info.merkle_root());
-
-    let (x_only_pub_key, _parity) = recovery_key_pair.to_inner().x_only_public_key();
-    assert_eq!(
-      Address::p2tr_tweaked(
-        TweakedPublicKey::dangerous_assume_tweaked(x_only_pub_key),
-        network,
-      ),
-      commit_tx_address
-    );
-
-    let reveal_weight = reveal_tx.weight();
-
-    if !no_limit && reveal_weight > MAX_STANDARD_TX_WEIGHT.try_into().unwrap() {
-      bail!(
-        "reveal transaction weight greater than {MAX_STANDARD_TX_WEIGHT} (MAX_STANDARD_TX_WEIGHT): {reveal_weight}"
+      let (mut reveal_tx, fee) = Self::build_reveal_transaction(
+        &control_block,
+        reveal_fee_rate,
+        OutPoint {
+          txid: unsigned_commit_tx.txid(),
+          vout: vout.try_into().unwrap(),
+        },
+        TxOut {
+          script_pubkey: destination.script_pubkey(),
+          value: output.value,
+        },
+        &reveal_script,
       );
+
+      reveal_tx.output[0].value = reveal_tx.output[0]
+        .value
+        .checked_sub(fee.to_sat())
+        .context("commit transaction output value insufficient to pay transaction fee")?;
+
+      if reveal_tx.output[0].value < reveal_tx.output[0].script_pubkey.dust_value().to_sat() {
+        bail!("commit transaction output would be dust");
+      }
+
+      let mut sighash_cache = SighashCache::new(&mut reveal_tx);
+
+      let signature_hash = sighash_cache
+        .taproot_script_spend_signature_hash(
+          0,
+          &Prevouts::All(&[output]),
+          TapLeafHash::from_script(&reveal_script, LeafVersion::TapScript),
+          SchnorrSighashType::Default,
+        )
+        .expect("signature hash should compute");
+
+      let secp256k1 = Secp256k1::new();
+      let signature = secp256k1.sign_schnorr(
+        &secp256k1::Message::from_slice(signature_hash.as_inner())
+          .expect("should be cryptographically secure hash"),
+        &key_pair,
+      );
+
+      let witness = sighash_cache
+        .witness_mut(0)
+        .expect("getting mutable witness reference should work");
+      witness.push(signature.as_ref());
+      witness.push(reveal_script);
+      witness.push(&control_block.serialize());
+
+      let recovery_key_pair = key_pair.tap_tweak(&secp256k1, taproot_spend_info.merkle_root());
+      recovery_key_pairs.push(recovery_key_pair);
+
+      let (x_only_pub_key, _parity) = recovery_key_pair.to_inner().x_only_public_key();
+      assert_eq!(
+        Address::p2tr_tweaked(
+          TweakedPublicKey::dangerous_assume_tweaked(x_only_pub_key),
+          network,
+        ),
+        commit_tx_address
+      );
+
+      let reveal_weight = reveal_tx.weight();
+      reveal_txs.push(reveal_tx);
+
+      if !no_limit && reveal_weight > MAX_STANDARD_TX_WEIGHT.try_into().unwrap() {
+        bail!(
+          "reveal transaction weight greater than {MAX_STANDARD_TX_WEIGHT} (MAX_STANDARD_TX_WEIGHT): {reveal_weight}"
+        );
+      }
+      n += 1;
+      if n % 100 == 0 {
+        tprintln!("  [{n}]");
+      }
     }
 
-    Ok((unsigned_commit_tx, reveal_tx, recovery_key_pair))
+    Ok((unsigned_commit_tx, reveal_txs, recovery_key_pairs))
+  }
+
+  fn get_recovery_key(
+    client: &Client,
+    recovery_key_pair: TweakedKeyPair,
+    network: Network,
+  ) -> Result<String> {
+    let recovery_private_key = PrivateKey::new(recovery_key_pair.to_inner().secret_key(), network).to_wif();
+    Ok(format!("rawtr({})#{}", recovery_private_key, client.get_descriptor_info(&format!("rawtr({})", recovery_private_key))?.checksum))
   }
 
   #[allow(dead_code)]
@@ -309,12 +435,10 @@ impl Inscribe {
     recovery_key_pair: TweakedKeyPair,
     network: Network,
   ) -> Result {
-    let recovery_private_key = PrivateKey::new(recovery_key_pair.to_inner().secret_key(), network);
-
-    let info = client.get_descriptor_info(&format!("rawtr({})", recovery_private_key.to_wif()))?;
+    let descriptor = Self::get_recovery_key(client, recovery_key_pair, network)?;
 
     let response = client.import_descriptors(ImportDescriptors {
-      descriptor: format!("rawtr({})#{}", recovery_private_key.to_wif(), info.checksum),
+      descriptor,
       timestamp: Timestamp::Now,
       active: Some(false),
       range: None,
@@ -382,7 +506,7 @@ mod tests {
 
     let (commit_tx, reveal_tx, _private_key) = Inscribe::create_inscription_transactions(
       Some(satpoint(1, 0)),
-      inscription,
+      vec![inscription],
       BTreeMap::new(),
       Network::Bitcoin,
       utxos.into_iter().collect(),
@@ -396,10 +520,10 @@ mod tests {
 
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::cast_sign_loss)]
-    let fee = Amount::from_sat((1.0 * (reveal_tx.vsize() as f64)).ceil() as u64);
+    let fee = Amount::from_sat((1.0 * (reveal_tx[0].vsize() as f64)).ceil() as u64);
 
     assert_eq!(
-      reveal_tx.output[0].value,
+      reveal_tx[0].output[0].value,
       20000 - fee.to_sat() - (20000 - commit_tx.output[0].value),
     );
   }
@@ -413,7 +537,7 @@ mod tests {
 
     let (commit_tx, reveal_tx, _) = Inscribe::create_inscription_transactions(
       Some(satpoint(1, 0)),
-      inscription,
+      vec![inscription],
       BTreeMap::new(),
       Network::Bitcoin,
       utxos.into_iter().collect(),
@@ -426,7 +550,7 @@ mod tests {
     .unwrap();
 
     assert!(commit_tx.is_explicitly_rbf());
-    assert!(reveal_tx.is_explicitly_rbf());
+    assert!(reveal_tx[0].is_explicitly_rbf());
   }
 
   #[test]
@@ -448,7 +572,7 @@ mod tests {
 
     let error = Inscribe::create_inscription_transactions(
       satpoint,
-      inscription,
+      vec![inscription],
       inscriptions,
       Network::Bitcoin,
       utxos.into_iter().collect(),
@@ -490,7 +614,7 @@ mod tests {
 
     assert!(Inscribe::create_inscription_transactions(
       satpoint,
-      inscription,
+      vec![inscription],
       inscriptions,
       Network::Bitcoin,
       utxos.into_iter().collect(),
@@ -526,7 +650,7 @@ mod tests {
 
     let (commit_tx, reveal_tx, _private_key) = Inscribe::create_inscription_transactions(
       satpoint,
-      inscription,
+      vec![inscription],
       inscriptions,
       bitcoin::Network::Signet,
       utxos.into_iter().collect(),
@@ -555,11 +679,11 @@ mod tests {
 
     let fee = FeeRate::try_from(fee_rate)
       .unwrap()
-      .fee(reveal_tx.vsize())
+      .fee(reveal_tx[0].vsize())
       .to_sat();
 
     assert_eq!(
-      reveal_tx.output[0].value,
+      reveal_tx[0].output[0].value,
       20_000 - fee - (20_000 - commit_tx.output[0].value),
     );
   }
@@ -588,7 +712,7 @@ mod tests {
 
     let (commit_tx, reveal_tx, _private_key) = Inscribe::create_inscription_transactions(
       satpoint,
-      inscription,
+      vec![inscription],
       inscriptions,
       bitcoin::Network::Signet,
       utxos.into_iter().collect(),
@@ -617,11 +741,11 @@ mod tests {
 
     let fee = FeeRate::try_from(fee_rate)
       .unwrap()
-      .fee(reveal_tx.vsize())
+      .fee(reveal_tx[0].vsize())
       .to_sat();
 
     assert_eq!(
-      reveal_tx.output[0].value,
+      reveal_tx[0].output[0].value,
       20_000 - fee - (20_000 - commit_tx.output[0].value),
     );
   }
@@ -637,7 +761,7 @@ mod tests {
 
     let error = Inscribe::create_inscription_transactions(
       satpoint,
-      inscription,
+      vec![inscription],
       BTreeMap::new(),
       Network::Bitcoin,
       utxos.into_iter().collect(),
@@ -668,7 +792,7 @@ mod tests {
 
     let (_commit_tx, reveal_tx, _private_key) = Inscribe::create_inscription_transactions(
       satpoint,
-      inscription,
+      vec![inscription],
       BTreeMap::new(),
       Network::Bitcoin,
       utxos.into_iter().collect(),
@@ -680,6 +804,6 @@ mod tests {
     )
     .unwrap();
 
-    assert!(reveal_tx.size() >= MAX_STANDARD_TX_WEIGHT as usize);
+    assert!(reveal_tx[0].size() >= MAX_STANDARD_TX_WEIGHT as usize);
   }
 }

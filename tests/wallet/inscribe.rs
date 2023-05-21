@@ -154,7 +154,8 @@ fn refuse_to_reinscribe_sats() {
 
   rpc_server.mine_blocks(1);
 
-  let Inscribe { reveal, .. } = inscribe(&rpc_server);
+  let Inscribe { reveals, .. } = inscribe(&rpc_server);
+  let reveal = reveals[0];
 
   rpc_server.mine_blocks_with_subsidy(1, 100);
 
@@ -174,10 +175,12 @@ fn refuse_to_inscribe_already_inscribed_utxo() {
   create_wallet(&rpc_server);
 
   let Inscribe {
-    reveal,
-    inscription,
+    reveals,
+    inscriptions,
     ..
   } = inscribe(&rpc_server);
+  let reveal = reveals[0];
+  let inscription = &inscriptions[0];
 
   let output = OutPoint {
     txid: reveal,
@@ -202,12 +205,13 @@ fn inscribe_with_optional_satpoint_arg() {
   create_wallet(&rpc_server);
   let txid = rpc_server.mine_blocks(1)[0].txdata[0].txid();
 
-  let Inscribe { inscription, .. } = CommandBuilder::new(format!(
+  let Inscribe { inscriptions, .. } = CommandBuilder::new(format!(
     "wallet inscribe foo.txt --satpoint {txid}:0:0 --fee-rate 1"
   ))
   .write("foo.txt", "FOO")
   .rpc_server(&rpc_server)
   .output();
+  let inscription = &inscriptions[0];
 
   rpc_server.mine_blocks(1);
 
@@ -381,7 +385,7 @@ fn inscribe_to_specific_destination() {
   .write("degenerate.png", [1; 520])
   .rpc_server(&rpc_server)
   .output::<Inscribe>()
-  .reveal;
+  .reveals[0];
 
   let reveal_tx = &rpc_server.mempool()[1]; // item 0 is the commit, item 1 is the reveal.
   assert_eq!(reveal_tx.txid(), txid);

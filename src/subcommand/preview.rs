@@ -73,26 +73,25 @@ impl Preview {
 
     rpc_client.generate_to_address(101, &address)?;
 
-    for file in self.inscriptions {
-      Arguments {
-        options: options.clone(),
-        subcommand: Subcommand::Wallet(super::wallet::Wallet::Inscribe(
-          super::wallet::inscribe::Inscribe {
-            fee_rate: FeeRate::try_from(1.1).unwrap(),
-            commit_fee_rate: None,
-            file,
-            no_backup: true,
-            satpoint: None,
-            dry_run: false,
-            no_limit: false,
-            destination: None,
-          },
-        )),
-      }
+    Arguments {
+      options: options.clone(),
+      subcommand: Subcommand::Wallet(super::wallet::Wallet::Inscribe(
+        super::wallet::inscribe::Inscribe {
+          fee_rate: FeeRate::try_from(1.1).unwrap(),
+          commit_fee_rate: None,
+          files: self.inscriptions,
+          no_backup: true,
+          no_broadcast: false,
+          satpoint: None,
+          dry_run: false,
+          dump: false,
+          no_limit: false,
+          destination: None,
+        },
+      )),
+    }
       .run()?;
 
-      rpc_client.generate_to_address(1, &address)?;
-    }
 
     rpc_client.generate_to_address(1, &address)?;
 
