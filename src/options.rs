@@ -2,18 +2,18 @@ use {super::*, bitcoincore_rpc::Auth};
 
 #[derive(Clone, Default, Debug, Parser)]
 #[clap(group(
-  ArgGroup::new("chains")
-    .required(false)
-    .args(&["chain-argument", "signet", "regtest", "testnet"]),
+ArgGroup::new("chains")
+.required(false)
+.args(& ["chain-argument", "signet", "regtest", "testnet"]),
 ))]
 pub(crate) struct Options {
   #[clap(long, help = "Load Litecoin Core data dir from <LITECOIN_DATA_DIR>.")]
   pub(crate) litecoin_data_dir: Option<PathBuf>,
   #[clap(
-    long = "chain",
-    arg_enum,
-    default_value = "mainnet",
-    help = "Use <CHAIN>."
+  long = "chain",
+  arg_enum,
+  default_value = "mainnet",
+  help = "Use <CHAIN>."
   )]
   pub(crate) chain_argument: Chain,
   #[clap(long, help = "Load configuration from <CONFIG>.")]
@@ -25,8 +25,8 @@ pub(crate) struct Options {
   #[clap(long, help = "Store index in <DATA_DIR>.")]
   pub(crate) data_dir: Option<PathBuf>,
   #[clap(
-    long,
-    help = "Don't look for inscriptions below <FIRST_INSCRIPTION_HEIGHT>."
+  long,
+  help = "Don't look for inscriptions below <FIRST_INSCRIPTION_HEIGHT>."
   )]
   pub(crate) first_inscription_height: Option<u64>,
   #[clap(long, help = "Limit index to <HEIGHT_LIMIT> blocks.")]
@@ -45,6 +45,8 @@ pub(crate) struct Options {
   pub(crate) testnet: bool,
   #[clap(long, default_value = "ord", help = "Use wallet named <WALLET>.")]
   pub(crate) wallet: String,
+  #[clap(long, help = "Don't check for standard wallet descriptors.")]
+  pub(crate) ignore_descriptors: bool,
 }
 
 impl Options {
@@ -194,25 +196,27 @@ impl Options {
       }
 
       // Functionally not supported with Litecoin
-      // let descriptors = client.list_descriptors(None)?.descriptors;
+      // if !self.ignore_descriptors {
+      //   let descriptors = client.list_descriptors(None)?.descriptors;
 
-      // let tr = descriptors
-      //   .iter()
-      //   .filter(|descriptor| descriptor.desc.starts_with("tr("))
-      //   .count();
+      //   let tr = descriptors
+      //     .iter()
+      //     .filter(|descriptor| descriptor.desc.starts_with("tr("))
+      //     .count();
 
-      // let rawtr = descriptors
-      //   .iter()
-      //   .filter(|descriptor| descriptor.desc.starts_with("rawtr("))
-      //   .count();
+      //   let rawtr = descriptors
+      //     .iter()
+      //     .filter(|descriptor| descriptor.desc.starts_with("rawtr("))
+      //     .count();
 
-      // if tr != 2 || descriptors.len() != 2 + rawtr {
-      //   bail!("wallet \"{}\" contains unexpected output descriptors, and does not appear to be an `ord` wallet, create a new wallet with `ord wallet create`", self.wallet);
+      //   if tr != 2 || descriptors.len() != 2 + rawtr {
+      //     bail!("wallet \"{}\" contains unexpected output descriptors, and does not appear to be an `ord` wallet, create a new wallet with `ord wallet create`", self.wallet);
+      //   }
       // }
-    }
-
-    Ok(client)
   }
+
+  Ok(client)
+}
 }
 
 #[cfg(test)]
@@ -455,7 +459,7 @@ mod tests {
       "--rpc-url",
       &rpc_server.url(),
     ])
-    .unwrap();
+      .unwrap();
 
     assert_eq!(
       options.bitcoin_rpc_client().unwrap_err().to_string(),
@@ -556,7 +560,7 @@ mod tests {
     fs::write(&path, format!("hidden:\n- \"{id}\"")).unwrap();
 
     assert_eq!(
-      Arguments::try_parse_from(["ord", "--config", path.to_str().unwrap(), "index",])
+      Arguments::try_parse_from(["ord", "--config", path.to_str().unwrap(), "index", ])
         .unwrap()
         .options
         .load_config()
@@ -579,7 +583,7 @@ mod tests {
       tempdir.path().join("ord.yaml"),
       format!("hidden:\n- \"{id}\""),
     )
-    .unwrap();
+      .unwrap();
 
     assert_eq!(
       Arguments::try_parse_from([
@@ -588,10 +592,10 @@ mod tests {
         tempdir.path().to_str().unwrap(),
         "index",
       ])
-      .unwrap()
-      .options
-      .load_config()
-      .unwrap(),
+        .unwrap()
+        .options
+        .load_config()
+        .unwrap(),
       Config {
         hidden: iter::once(id).collect(),
       }
