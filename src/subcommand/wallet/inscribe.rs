@@ -69,6 +69,11 @@ pub(crate) struct Inscribe {
   pub(crate) dump: bool,
   #[clap(long, help = "Send inscription to <DESTINATION>.")]
   pub(crate) destination: Option<Address>,
+  #[clap(
+    long,
+    help = "Amount of postage to include in the inscription. Default `10000 sats`"
+  )]
+  pub(crate) postage: Option<Amount>,
 }
 
 impl Inscribe {
@@ -107,6 +112,10 @@ impl Inscribe {
         self.commit_fee_rate.unwrap_or(self.fee_rate),
         self.fee_rate,
         self.no_limit,
+        match self.postage {
+          Some(postage) => postage,
+          _ => TransactionBuilder::DEFAULT_TARGET_POSTAGE,
+        },
       )?;
 
     tprintln!("[sign commit]");
@@ -229,6 +238,7 @@ impl Inscribe {
     commit_fee_rate: FeeRate,
     reveal_fee_rate: FeeRate,
     no_limit: bool,
+    postage: Amount,
   ) -> Result<(Transaction, Vec<Transaction>, Vec<TweakedKeyPair>)> {
     let satpoint = if let Some(satpoint) = satpoint {
       satpoint
@@ -309,7 +319,7 @@ impl Inscribe {
       );
       reveal_scripts.push(reveal_script);
       control_blocks.push(control_block);
-      reveal_fees.push(reveal_fee + TransactionBuilder::TARGET_POSTAGE);
+      reveal_fees.push(reveal_fee + postage);
     }
 
     tprintln!("[make commit]");
@@ -515,6 +525,7 @@ mod tests {
       FeeRate::try_from(1.0).unwrap(),
       FeeRate::try_from(1.0).unwrap(),
       false,
+      TransactionBuilder::DEFAULT_TARGET_POSTAGE,
     )
     .unwrap();
 
@@ -546,6 +557,7 @@ mod tests {
       FeeRate::try_from(1.0).unwrap(),
       FeeRate::try_from(1.0).unwrap(),
       false,
+      TransactionBuilder::DEFAULT_TARGET_POSTAGE,
     )
     .unwrap();
 
@@ -581,6 +593,7 @@ mod tests {
       FeeRate::try_from(1.0).unwrap(),
       FeeRate::try_from(1.0).unwrap(),
       false,
+      TransactionBuilder::DEFAULT_TARGET_POSTAGE,
     )
     .unwrap_err()
     .to_string();
@@ -623,6 +636,7 @@ mod tests {
       FeeRate::try_from(1.0).unwrap(),
       FeeRate::try_from(1.0).unwrap(),
       false,
+      TransactionBuilder::DEFAULT_TARGET_POSTAGE,
     )
     .is_ok())
   }
@@ -659,6 +673,7 @@ mod tests {
       FeeRate::try_from(fee_rate).unwrap(),
       FeeRate::try_from(fee_rate).unwrap(),
       false,
+      TransactionBuilder::DEFAULT_TARGET_POSTAGE,
     )
     .unwrap();
 
@@ -721,6 +736,7 @@ mod tests {
       FeeRate::try_from(commit_fee_rate).unwrap(),
       FeeRate::try_from(fee_rate).unwrap(),
       false,
+      TransactionBuilder::DEFAULT_TARGET_POSTAGE,
     )
     .unwrap();
 
@@ -770,6 +786,7 @@ mod tests {
       FeeRate::try_from(1.0).unwrap(),
       FeeRate::try_from(1.0).unwrap(),
       false,
+      TransactionBuilder::DEFAULT_TARGET_POSTAGE,
     )
     .unwrap_err()
     .to_string();
@@ -801,6 +818,7 @@ mod tests {
       FeeRate::try_from(1.0).unwrap(),
       FeeRate::try_from(1.0).unwrap(),
       true,
+      TransactionBuilder::DEFAULT_TARGET_POSTAGE,
     )
     .unwrap();
 

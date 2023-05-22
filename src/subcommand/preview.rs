@@ -64,7 +64,7 @@ impl Preview {
     super::wallet::Wallet::Create(super::wallet::create::Create {
       passphrase: "".into(),
     })
-    .run(options.clone())?;
+      .run(options.clone())?;
 
     let rpc_client = options.bitcoin_rpc_client_for_wallet_command(false)?;
 
@@ -87,11 +87,10 @@ impl Preview {
           dump: false,
           no_limit: false,
           destination: None,
+          postage: Some(TransactionBuilder::DEFAULT_TARGET_POSTAGE),
         },
       )),
-    }
-      .run()?;
-
+    }.run()?;
 
     rpc_client.generate_to_address(1, &address)?;
 
@@ -99,7 +98,7 @@ impl Preview {
       options,
       subcommand: Subcommand::Server(self.server),
     }
-    .run()?;
+      .run()?;
 
     Ok(())
   }
